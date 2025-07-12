@@ -1,807 +1,975 @@
-import React, { useState, useEffect } from "react";
+import React, { useState } from "react";
 import Papa from "papaparse";
-import "./index.css";
-import { LLMConfig } from "../llm-config";
-import * as XLSX from 'xlsx';
+import * as XLSX from "xlsx";
+import Report from "./report";
+
+// Constants
+const YELLOW_FIELDS = [
+  "ResolSLA",
+  "RespSLA",
+  "ReqComp",
+  "ReqCrDtConc",
+  "EnDtConc",
+  "HisChDtTiConc",
+  "ElapsedTime",
+  "CalcPreDt",
+  "RefinedPreDt",
+  "CalcStDt",
+  "RefinedStDt",
+  "Cumilative",
+  "ResolSOW",
+  "RespSOW",
+  "ResolRem",
+  "RespRem",
+  "Rollover",
+  "ReqCrYM",
+  "DateRollover",
+  "DateReqCrYM"
+];
+
+// Holiday data for multiple years (2021-2025)
+const HOLIDAYS_BY_YEAR = {
+  "2024": [
+    "2024-01-01",
+    "2024-01-14",
+    "2024-01-26",
+    "2024-03-29",
+    "2024-04-02",
+    "2024-04-13",
+    "2024-04-14",
+    "2024-04-21",
+    "2024-06-02",
+    "2024-08-15",
+    "2024-09-10",
+    "2024-10-02",
+    "2024-10-31",
+    "2024-12-25"
+  ],
+  "2025": [
+    "2025-01-01",
+    "2025-01-14",
+    "2025-02-27",
+    "2025-03-31",
+    "2025-05-01",
+    "2025-08-15",
+    "2025-08-27",
+    "2025-10-02",
+    "2025-10-21",
+    "2025-12-25"
+  ]
+};
+
+const SLA_TABLE = {
+  P1: { respsow: 0.5, resolsow: 4 },
+  P2: { respsow: 2, resolsow: 9 },
+  P3: { respsow: 9, resolsow: 45 },
+  P4: { respsow: 18, resolsow: 90 },
+};
+
+const WORK_HOURS = {
+  start: "14:00:00",
+  end: "23:00:00",
+};
+
+const dateUtils = {
+  excelSerialToDate: (serial) => {
+    if (!serial || isNaN(serial)) return null;
+    const excelEpoch = new Date(1900, 0, 1);
+    const days = Math.floor(serial) - 2;
+    return new Date(excelEpoch.getTime() + days * 24 * 60 * 60 * 1000);
+  },
+
+  formatTime: (timeStr) => {
+    if (!timeStr || typeof timeStr !== "string") return "00:00:00";
+    timeStr = timeStr.replace(/[^0-9]/g, "").padStart(6, "0");
+    return timeStr.length >= 6
+      ? `${timeStr.slice(0, 2)}:${timeStr.slice(2, 4)}:${timeStr.slice(4, 6)}`
+      : "00:00:00";
+  },
+
+  formatDate: (date) => {
+    if (!(date instanceof Date) || isNaN(date)) return "";
+    return `${String(date.getMonth() + 1).padStart(2, "0")}/${String(
+      date.getDate()
+    ).padStart(2, "0")}/${date.getFullYear()}`;
+  },
+
+  parseDateTime: (dateVal, timeStr, index) => {
+    try {
+      let date;
+      if (typeof dateVal === "number") {
+        date = dateUtils.excelSerialToDate(dateVal);
+      } else if (typeof dateVal === "string") {
+        const datePart = dateVal?.split(" ")[0];
+        const [day, month, year] = datePart.split('/');
+        const swappedDate = `${month}/${day}/${year}`;
+        date = new Date(swappedDate);
+      } else {
+        date = new Date(dateVal);
+      }
+      if (!date || isNaN(date)) return null;
+      const time = dateUtils.formatTime(timeStr);
+      return new Date(`${dateUtils.formatDate(date)} ${time}`);
+    } catch (e) {
+      console.error("Error parsing date/time:", e);
+      return null;
+    }
+  },
+
+  convertExcelDate: (excelDate) => {
+    if (typeof excelDate === "string" && excelDate.includes("/")) {
+      return excelDate;
+    }
+    if (typeof excelDate === "number") {
+      const date = new Date(Math.round((excelDate - 25569) * 86400 * 1000));
+      return date.toLocaleDateString("en-GB");
+    }
+    return dateUtils.formatDate(excelDate);
+  },
+};
+
+const calculationUtils = {
+  excelMod: (date) => date - Math.floor(date),
+
+  excelMedian: (a, b, c) => [a, b, c].sort((x, y) => x - y)[1],
+
+  networkDaysIntl: (startDate, endDate, holidays = []) => {
+    if (!startDate || !endDate || isNaN(startDate) || isNaN(endDate)) return 0;
+
+    const holidayDates = holidays.map((holiday) =>
+      new Date(holiday).setHours(0, 0, 0, 0)
+    );
+    let days = 0;
+    let current = new Date(startDate);
+    current.setHours(0, 0, 0, 0);
+    const end = new Date(endDate);
+    end.setHours(0, 0, 0, 0);
+
+    while (current <= end) {
+      const day = current.getDay();
+      const currentTime = current.setHours(0, 0, 0, 0);
+      if (day !== 0 && day !== 6 && !holidayDates.includes(currentTime)) {
+        days++;
+      }
+      current.setDate(current.getDate() + 1);
+    }
+    return days;
+  },
+
+  calculateWorkingHours: (
+    startDate,
+    endDate,
+    workStartTimeStr,
+    workEndTimeStr,
+    holidays
+  ) => {
+    if (!startDate || !endDate || isNaN(startDate) || isNaN(endDate)) return 0;
+    if (endDate < startDate) return 0;
+
+    const [workStartHours, workStartMinutes] = workStartTimeStr
+      .split(":")
+      .map(Number);
+    const [workEndHours, workEndMinutes] = workEndTimeStr
+      .split(":")
+      .map(Number);
+
+    const workDayStart = workStartHours + workStartMinutes / 60;
+    const workDayEnd = workEndHours + workEndMinutes / 60;
+    const workDayLength = workDayEnd - workDayStart;
+
+    const networkDays = calculationUtils.networkDaysIntl(
+      startDate,
+      endDate,
+      holidays
+    );
+
+    if (networkDays === 0) return 0;
+
+    const getMedTime = (date) => {
+      const hours = date.getHours() + date.getMinutes() / 60;
+
+      if (!isWorkingDay(date, holidays)) {
+        return workDayEnd;
+      }
+
+      return Math.max(workDayStart, Math.min(hours, workDayEnd));
+    };
+
+    const startMedTime = isWorkingDay(startDate, holidays)
+      ? getMedTime(startDate)
+      : workDayStart;
+
+    const endMedTime = isWorkingDay(endDate, holidays) ? getMedTime(endDate) : workDayEnd;
+
+    const fullDaysPart = (networkDays - 1) * workDayLength;
+
+    const result = (fullDaysPart + (endMedTime - startMedTime)) * 24;
+    return parseFloat(result.toFixed(8));
+  },
+
+  calculatePreDt: (
+    startDate,
+    endDate,
+    workStartTimeStr,
+    workEndTimeStr,
+    holidays,
+    index
+  ) => {
+    if (!startDate || !endDate || isNaN(startDate) || isNaN(endDate)) return 0;
+
+    const [workStartHours, workStartMinutes] = workStartTimeStr
+      .split(":")
+      .map(Number);
+    const [workEndHours, workEndMinutes] = workEndTimeStr
+      .split(":")
+      .map(Number);
+
+    const workDayStart = workStartHours + workStartMinutes / 60;
+    const workDayEnd = workEndHours + workEndMinutes / 60;
+    const workDayLength = workDayEnd - workDayStart;
+
+    const holidayTimestamps = holidays.map((h) =>
+      new Date(h).setHours(0, 0, 0, 0)
+    );
+
+    const isWorkingDay = (date) => {
+      const day = date.getDay();
+      const dateTimestamp = new Date(date).setHours(0, 0, 0, 0);
+      return (
+        day !== 0 && day !== 6 && !holidayTimestamps.includes(dateTimestamp)
+      );
+    };
+
+    let adjustedStartDate = new Date(startDate);
+    if (!isWorkingDay(adjustedStartDate)) {
+      while (!isWorkingDay(adjustedStartDate)) {
+        adjustedStartDate.setDate(adjustedStartDate.getDate() + 1);
+        adjustedStartDate.setHours(0, 0, 0, 0);
+      }
+      adjustedStartDate.setHours(workStartHours, workStartMinutes, 0, 0);
+    }
+
+    const networkDays = calculationUtils.networkDaysIntl(
+      adjustedStartDate,
+      endDate,
+      holidays
+    );
+if(index==3){
+  console.log(networkDays,  adjustedStartDate,
+    endDate,
+    holidays,'networkDays')
+}
+    if (networkDays === 0) return 0;
+
+    const getMedTime = (date) => {
+      if (!isWorkingDay(date)) {
+        return workDayEnd;
+      }
+      const hours =
+        date.getHours() + date.getMinutes() / 60 + date.getSeconds() / 3600;
+      return Math.max(workDayStart, Math.min(hours, workDayEnd));
+    };
+
+    const startMedTime = getMedTime(adjustedStartDate);
+    const endMedTime = getMedTime(endDate);
+
+    let result = 0;
+    if (networkDays === 1) {
+      if (isWorkingDay(adjustedStartDate) && isWorkingDay(endDate)) {
+        result = endMedTime - startMedTime;
+      }
+    } else {
+      const fullDaysPart = (networkDays - 1) * workDayLength;
+      result = fullDaysPart + (endMedTime - startMedTime);
+    }
+
+    result = result > 0 ? parseFloat(result.toFixed(2)) : 0.0;
+    return result;
+  },
+};
+
+function parseCustomDate(dateString) {
+  const [datePart, timePart] = dateString.split(' ');
+  const [month, day, year] = datePart.split('/');
+  const [hours, minutes, seconds] = timePart.split(':');
+  
+  return new Date(
+    `${year}-${month}-${day}T${hours}:${minutes}:${seconds}`
+  );
+}
+
+function convertToISODate(dateStr) {
+  if (!dateStr) return '';
+  
+  const [day, month, year] = dateStr.split('/');
+  
+  // Validate date components
+  if (!day || !month || !year || day.length !== 2 || month.length !== 2 || year.length !== 4) {
+    console.error('Invalid date format. Expected DD/MM/YYYY');
+    return '';
+  }
+
+  return `${year}-${month}-${day}`;
+}
+
+
+const isWorkingDay = (date, holidays) => {
+  const day = date.getDay();
+  const dateTimestamp = new Date(date).setHours(0, 0, 0, 0);
+  const holidayTimestamps = holidays.map(h => new Date(h).setHours(0, 0, 0, 0));
+  return day !== 0 && day !== 6 && !holidayTimestamps.includes(dateTimestamp);
+};
 
 export const MainPages = () => {
   const [csvData, setCsvData] = useState(null);
-  const [csvData2, setCsvData2] = useState(null);
-  const [dateColumns, setDateColumns] = useState(
-    "Creation Time,Historical Status - Change Time"
-  );
   const [file, setFile] = useState(null);
-  const [filters, setFilters] = useState({
-    ticket: '',
-    assignedTo: '',
-    priority: '',
-    allowedDuration: '',
-    breached: '',
-    status: '',
-    creationDateFrom: '',
-    creationDateTo: '',
-    timeToBreachOption: 'eq',
-    timeToBreachValue: ''
-  });
-  const calculateWorkingHours = (data1) => {
-    console.log(data1)
-    const addColumns = (data) => {
-        // Add only Change column
-        const changeIndex = data[0].length;
-        
-        // Add header
-        data[0][changeIndex] = "Change";
-        
-        // Add empty values for all rows
-        for (let i = 1; i < data.length; i++) {
-            data[i][changeIndex] = "";
-        }
-        return data;
-    };
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [holidays, setHolidays] = useState([]);
 
-    const data = addColumns(data1);
+  const getHolidaysForYears = (years) => {
+    const uniqueYears = [...new Set(years)];
+    const allHolidays = [];
+    
+    uniqueYears.forEach(year => {
+      if (HOLIDAYS_BY_YEAR[year]) {
+        allHolidays.push(...HOLIDAYS_BY_YEAR[year]);
+      }
+    });
+    console.log(allHolidays,'all holidays')
+    return allHolidays;
+  };
 
-    const workingHoursStart = 14; // 2 PM
-    const workingHoursEnd = 23; // 11 PM
+  const processExcelData = (data) => {
+    console.log(data,'sdfijsn')
+    const headers = data[0].map((h) => h?.toString().trim() || "");
+    const reqCreationDateIndex = headers.indexOf("Req. Creation Date");
+    const historicalStatusChangeDateIndex = headers.indexOf(
+        "Historical Status - Change Date"
+    );
 
-    const parseDateTime = (dateTimeString, timeStr) => {
-        try {
-            // Case 1: When date and time are passed separately (original CSV format)
-            if (timeStr !== undefined) {
-                const [day, month, year] = dateTimeString.split("/");
-                const [hours, minutes] = timeStr.split(":");
-                return new Date(`20${year}`, month - 1, day, parseInt(hours, 10), parseInt(minutes, 10), 0);
+    const rows = data
+        .slice(1)
+        .filter((row) =>
+            row.some((cell) => cell !== undefined && cell !== null && cell !== "")
+        )
+        .map((row) => {
+            const newRow = [...row];
+            while (newRow.length < headers.length) newRow.push("");
+            if (reqCreationDateIndex !== -1 && newRow[reqCreationDateIndex]) {
+                newRow[reqCreationDateIndex] = dateUtils.convertExcelDate(
+                    newRow[reqCreationDateIndex]
+                );
             }
-
-            // Case 2: When it's a combined string (CSV format "DD/MM/YY HH:MM")
-            if (typeof dateTimeString === 'string' && dateTimeString.includes('/')) {
-                const [datePart, timePart] = dateTimeString.split(" ");
-                const [day, month, year] = datePart.split("/");
-                const [hours, minutes] = timePart.split(":");
-                return new Date(`20${year}`, month - 1, day, parseInt(hours, 10), parseInt(minutes, 10), 0);
+            if (
+                historicalStatusChangeDateIndex !== -1 &&
+                newRow[historicalStatusChangeDateIndex]
+            ) {
+                newRow[historicalStatusChangeDateIndex] = dateUtils.convertExcelDate(
+                    newRow[historicalStatusChangeDateIndex]
+                );
             }
-
-            // Case 3: When it's an Excel date (number or Date object)
-            if (dateTimeString instanceof Date) {
-                return dateTimeString;
-            }
-            if (typeof dateTimeString === 'number') {
-                return new Date(Math.round((dateTimeString - 25569) * 86400 * 1000));
-            }
-
-            // Fallback: Try to parse as is
-            return new Date(dateTimeString);
-        } catch (error) {
-            console.error("Error parsing date:", error, "Input:", dateTimeString, timeStr);
-            return new Date(); // Return current date as fallback
-        }
-    };
-
-    const isWeekend = (date) => {
-        const day = date.getDay();
-        return day === 0 || day === 6; // 0 is Sunday, 6 is Saturday
-    };
-
-    const calculateTimeDifference = (startDateTime, endDateTime) => {
-        let start = new Date(startDateTime);
-        let end = new Date(endDateTime);
-        let reason = [];
-        let totalHours = 0;
-
-        // If same day and both on weekend
-        if (start.toDateString() === end.toDateString() && isWeekend(start)) {
-            reason.push("Weekend day - no hours counted");
-            return { hours: 0, reason: reason.join(". "), start, end };
-        }
-
-        // Iterate through each day between start and end
-        let currentDate = new Date(start);
-        while (currentDate <= end) {
-            if (!isWeekend(currentDate)) {
-                let dayStart = new Date(currentDate);
-                let dayEnd = new Date(currentDate);
-                
-                // Set working hours boundaries
-                dayStart.setHours(workingHoursStart, 0, 0);
-                dayEnd.setHours(workingHoursEnd, 0, 0);
-
-                // Adjust start time for first day
-                if (currentDate.toDateString() === start.toDateString()) {
-                    if (start.getHours() >= workingHoursEnd) {
-                        // Skip this day if start is after working hours
-                        currentDate.setDate(currentDate.getDate() + 1);
-                        continue;
-                    }
-                    dayStart = start.getHours() < workingHoursStart ? dayStart : start;
-                }
-
-                // Adjust end time for last day
-                if (currentDate.toDateString() === end.toDateString()) {
-                    if (end.getHours() < workingHoursStart) {
-                        break;
-                    }
-                    dayEnd = end.getHours() >= workingHoursEnd ? dayEnd : end;
-                }
-
-                // Calculate hours for this day
-                if (dayEnd > dayStart) {
-                    const diffMs = dayEnd - dayStart;
-                    const hoursToday = diffMs / (1000 * 60 * 60);
-                    totalHours += hoursToday;
-                }
-            }
-
-            // Move to next day
-            currentDate.setDate(currentDate.getDate() + 1);
-        }
-
-        // Add explanation to reason
-        if (totalHours > 0) {
-            if (isWeekend(start)) {
-                reason.push("Start date was on weekend - counting started from next working day");
-            }
-            if (isWeekend(end)) {
-                reason.push("End date was on weekend - counting ended on previous working day");
-            }
-            reason.push("Counted working hours between valid working days");
-        } else {
-            reason.push("No valid working hours found between dates");
-        }
-
-        return {
-            hours: totalHours,
-            reason: reason.join(". "),
-            start,
-            end
-        };
-    };
-
-    // Group by ticket ID and status
-    const ticketGroups = {};
-    for (let i = 1; i < data.length; i++) {
-        const row = data[i];
-        const ticketId = row[3]; // Request-ID column
-        const statusFrom = row[5]; // Historical Status - Status From
-        const statusTo = row[6];   // Historical Status - Status To
-        
-        if (!ticketGroups[ticketId]) {
-            ticketGroups[ticketId] = [];
-        }
-        ticketGroups[ticketId].push({
-            row: row,
-            date: parseDateTime(row[7], row[8]),
-            statusFrom: statusFrom,
-            statusTo: statusTo
+            return newRow;
         });
-    }
-    // Process each ticket's records
-    for (const ticketId in ticketGroups) {
-        const records = ticketGroups[ticketId].sort((a, b) => a.date - b.date);
 
-        for (let i = 0; i < records.length; i++) {
-            const currentRecord = records[i];
-            let result = { hours: 0, reason: "", start: null, end: null };
-
-            if (i === 0) {
-                if (currentRecord.date.getHours() >= workingHoursStart) {
-                    const startTime = new Date(currentRecord.date);
-                    startTime.setHours(workingHoursStart, 0, 0);
-                    result = calculateTimeDifference(startTime, currentRecord.date);
-                } else {
-                    result.reason = "First record before working hours";
-                    result.start = currentRecord.date;
-                    result.end = currentRecord.date;
-                }
-            } else {
-                const prevRecord = records[i - 1];
-                result = calculateTimeDifference(prevRecord.date, currentRecord.date);
-            }
-
-            // Format the time
-            const hours = Math.floor(result.hours);
-            const minutes = Math.round((result.hours - hours) * 60);
-            
-            // Find the index for Change column
-            const changeIndex = currentRecord.row.length - 1;
-            
-            // Set the Change column
-            currentRecord.row[changeIndex] = 
-                `${hours}:${minutes.toString().padStart(2, '0')} h`;
+    // Identify empty columns (columns where all cells are empty)
+    const emptyColumns = [];
+    for (let col = 0; col < headers.length; col++) {
+        const isHeaderEmpty = headers[col] === "";
+        const isColumnEmpty = rows.every(row => row[col] === "" || row[col] === undefined || row[col] === null);
+        
+        if (isHeaderEmpty && isColumnEmpty) {
+            emptyColumns.push(col);
         }
     }
-console.log(data)
-    updateTemplate(data);
-};
 
+    // Filter out empty columns (in reverse order to avoid index shifting)
+    emptyColumns.reverse().forEach(col => {
+        headers.splice(col, 1);
+        rows.forEach(row => row.splice(col, 1));
+    });
 
-const allowedHeaders = [
-  "Req. Creation Date",
-  "Creation Time",
-  "Request - ID",
-  "Request - Priority Description",
-  "Historical Status - Status From",
-  "Historical Status - Status To",
-  "Historical Status - Change Date",
-  "Historical Status - Change Time",
-  "Macro Area - Name",
-  "Request - Resource Assigned To - Name",
-  "Req. Status - Description",
-  "Change",
-  // "Details"
-];
+    const sortedRows = sortDataByRequestId(headers, rows);
 
-const updateTemplate = (data) => {
-  // Extract headers and values
-  const headers = data[0]; // First row contains headers
-  const values = data.slice(1); // Remaining rows contain values
+    return { headers, rows: sortedRows };
+  };
 
-  // Get the indices of required headers
-  const allowedIndices = headers
-    .map((header, index) => (allowedHeaders.includes(header) ? index : -1))
-    .filter(index => index !== -1); // Remove -1 (unwanted headers)
+  const sortDataByRequestId = (headers, rows) => {
+    const requestIdIndex = headers.indexOf("Request - ID");
+    const changeDateIndex = headers.indexOf("Historical Status - Change Date");
+    const changeTimeIndex = headers.indexOf("Historical Status - Change Time");
 
-  // Create filtered data with only allowed columns
-  const filteredData = values.map(row => allowedIndices.map(index => row[index]));
+    if (requestIdIndex === -1) return rows; // If no Request ID column, return as-is
 
+    // Group by Request ID
+    const groupedData = rows.reduce((acc, row) => {
+        const requestId = row[requestIdIndex];
+        if (!acc[requestId]) acc[requestId] = [];
+        acc[requestId].push(row);
+        return acc;
+    }, {});
 
-const validTransitions = [
-  "Forwarded to Assigned",
-  "Forwarded to Work in progress",
-  "Assigned to Work in progress",
-  "Work in progress to Suspended",
-  "Work in progress to Solved",
-  "Suspended to Solved",
-  "Forwarded to Suspended"
-];
-setCsvData([allowedHeaders,...filteredData]);
+    // Sort each group by date/time if available
+    Object.keys(groupedData).forEach(id => {
+        groupedData[id].sort((a, b) => {
+            // Try to sort by change date + time if available
+            if (changeDateIndex !== -1 && changeTimeIndex !== -1) {
+                const dateA = a[changeDateIndex];
+                const dateB = b[changeDateIndex];
+                const timeA = a[changeTimeIndex];
+                const timeB = b[changeTimeIndex];
 
-const statusFromIndex = headers.indexOf("Historical Status - Status From")-1;
-const statusToIndex = headers.indexOf("Historical Status - Status To")-1;
-  const finalData=[...filteredData].filter((item)=>{
-    const transition = `${item[statusFromIndex]} to ${item[statusToIndex]}`;
-if (validTransitions.includes(transition)) {
-  return true
-}
-  })
-console.log(finalData,'sss')
-  setCsvData2([allowedHeaders,...finalData]);
-};
+                // Parse dates (DD/MM/YYYY)
+                const [dayA, monthA, yearA] = dateA.split('/').map(Number);
+                const [dayB, monthB, yearB] = dateB.split('/').map(Number);
 
+                // Create Date objects
+                const dateObjA = new Date(yearA, monthA - 1, dayA);
+                const dateObjB = new Date(yearB, monthB - 1, dayB);
+
+                // If dates are different, sort by date
+                if (dateObjA.getTime() !== dateObjB.getTime()) {
+                    return dateObjA - dateObjB;
+                }
+
+                // If dates are same, sort by time
+                const [hoursA, minutesA, secondsA] = timeA.toString().padStart(6, '0').match(/.{1,2}/g).map(Number);
+                const [hoursB, minutesB, secondsB] = timeB.toString().padStart(6, '0').match(/.{1,2}/g).map(Number);
+
+                // Compare times
+                if (hoursA !== hoursB) return hoursA - hoursB;
+                if (minutesA !== minutesB) return minutesA - minutesB;
+                return secondsA - secondsB;
+            }
+            return 0;
+        });
+    });
+
+    // Flatten the grouped data back into an array
+    return Object.values(groupedData).flat();
+  };
 
   const handleFileUpload = (event) => {
-    setFile(event.target.files[0]);
-    const file = event.target.files?.[0];
+    const selectedFile = event.target.files?.[0];
+    if (!selectedFile) return;
+    setFile(selectedFile);
+  };
+
+  const handleSubmit = () => {
     if (!file) return;
+    setIsProcessing(true);
 
-    // Handle different file types based on extension
-    const fileExtension = file?.name?.split('.').pop().toLowerCase();
+    const fileExtension = file.name?.split(".").pop().toLowerCase();
 
-    if (fileExtension === 'csv') {
+    if (fileExtension === "csv") {
       Papa.parse(file, {
         complete: (result) => {
-          calculateWorkingHours(sortData(adjustDateColumns(result.data, dateColumns)));
+          processData(result.data);
+          setIsProcessing(false);
         },
-        error: (error) => {
-          console.error("Error parsing CSV:", error);
+        error: (err) => {
+          console.error(err);
+          setIsProcessing(false);
         },
         skipEmptyLines: true,
       });
-    } else if (['xlsx', 'xls'].includes(fileExtension)) {
+    } else if (["xlsx", "xls"].includes(fileExtension)) {
       const reader = new FileReader();
       reader.onload = (e) => {
         const data = e.target.result;
-        const workbook = XLSX.read(data, { type: 'array' });
-        const firstSheetName = workbook.SheetNames[0];
-        const worksheet = workbook.Sheets[firstSheetName];
-        const excelData = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
-        calculateWorkingHours(sortData(adjustDateColumns(excelData, dateColumns)));
+        const workbook = XLSX.read(data, { type: "array" });
+        const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+        const excelData = XLSX.utils.sheet_to_json(worksheet, {
+          header: 1,
+          defval: "",
+        });
+        processData(excelData);
+        setIsProcessing(false);
       };
       reader.readAsArrayBuffer(file);
     } else {
       console.error("Unsupported file type");
+      setIsProcessing(false);
     }
   };
 
-const sortData = (data) => {
+  const processData = (data) => {
+    if (!data || data.length === 0) return;
+    const { headers, rows } = processExcelData(data);
+    
+    // Extract years from the data to determine which holidays to use
+    const years = [];
+    const reqCreationDateIndex = headers.indexOf("Req. Creation Date");
+    const historicalChangeDateIndex = headers.indexOf("Historical Status - Change Date");
+    
+    rows.forEach(row => {
+      // Extract year from creation date
+      if (reqCreationDateIndex !== -1 && row[reqCreationDateIndex]) {
+        const dateParts = row[reqCreationDateIndex].split('/');
+        if (dateParts.length === 3) {
+          years.push(dateParts[2]);
+        }
+      }
+      
+      // Extract year from change date
+      if (historicalChangeDateIndex !== -1 && row[historicalChangeDateIndex]) {
+        const dateParts = row[historicalChangeDateIndex].split('/');
+        if (dateParts.length === 3) {
+          years.push(dateParts[2]);
+        }
+      }
+    });
+    
+    // Get holidays for all years present in the data
+    const relevantHolidays = getHolidaysForYears(years);
+    setHolidays(relevantHolidays);
 
-    const header = data[0];
-    const rows = data.slice(1);
+    const headerIndices = {
+      reqCreationDate: headers.indexOf("Req. Creation Date"),
+      creationTime: headers.indexOf("Creation Time"),
+      historicalStatusFrom: headers.indexOf("Historical Status - Status From"),
+      requestId: headers.indexOf("Request - ID"),
+      historicalStatusTo: headers.indexOf("Historical Status - Status To"),
+      reqStatusDescription: headers.indexOf("Req. Status - Description"),
+      historicalChangeDate: headers.indexOf("Historical Status - Change Date"),
+      historicalChangeTime: headers.indexOf("Historical Status - Change Time"),
+      priorityDescription: headers.indexOf("Request - Priority Description"),
+      reqClosingDate: headers.indexOf("Req. Closing Date"),
+      reqTypeDescription: headers.indexOf("Req. Type - Description EN"),
+    };
 
-    const groupedData = rows.reduce((acc, row) => {
-        if (!acc[row[3]]) acc[row[3]] = [];
-        acc[row[3]].push(row);
-        return acc;
-    }, {});
-
-
-    Object.keys(groupedData).forEach(id => {
-        groupedData[id].sort((a, b) => {
-            const dateA = parseDateTime(`${a[7]} ${a[8]}`);
-            const dateB = parseDateTime(`${b[7]} ${b[8]}`);
-            return dateA - dateB;
-        });
+    YELLOW_FIELDS.forEach((field) => {
+      if (!headers.includes(field)) {
+        headers.push(field);
+        headerIndices[field.toLowerCase()] = headers.length - 1;
+      } else {
+        headerIndices[field.toLowerCase()] = headers.indexOf(field);
+      }
     });
 
-    const sortedData = [header, ...Object.values(groupedData).flat()];
+    const firstPassRows = rows.map((row, index) => {
+      const newRow = [...row];
+      while (newRow.length < headers.length) newRow.push("");
 
-    return sortedData;
-};
+      const statusFrom = (newRow[headerIndices.historicalStatusFrom] || "")
+        .toString()
+        .trim();
+      const statusTo = (newRow[headerIndices.historicalStatusTo] || "")
+        .toString()
+        .trim();
+      const requestId = newRow[headerIndices.requestId];
+      const priority = (newRow[headerIndices.priorityDescription] || "P4 - Low")
+        .toString()
+        .trim();
+      const priorityLevel = priority?.split(" ")[0];
+      const creationDateVal = newRow[headerIndices.reqCreationDate];
+      const creationTime = newRow[headerIndices.creationTime];
+      const changeDateVal = newRow[headerIndices.historicalChangeDate];
+      const changeTime = newRow[headerIndices.historicalChangeTime];
+      const reqStatusDescription = (
+        newRow[headerIndices.reqStatusDescription] || ""
+      )
+      const reqTypeDescription = (
+        newRow[headerIndices.reqTypeDescription] || ""
+      )
+        .toString()
+        .trim();
+
+      const creationDateTime = dateUtils.parseDateTime(
+        creationDateVal,
+        creationTime
+      );
+      const changeDateTime = dateUtils.parseDateTime(changeDateVal, changeTime, index);
+
+      const creationDate = creationDateTime ? new Date(creationDateTime) : null;
+      const changeDate = changeDateTime ? new Date(changeDateTime) : null;
+
+      const allowedStatusesTo = [
+        "Work in progress", "Forwarded", "Assigned", 
+        "Solved", "Suspended", "Pending for IT check","Awaiting external provider"
+      ];
+      const excludedStatusesFrom = [
+        "Suspended", "Pending for IT check", 
+        "Awaiting external provider"
+      ];
+      
+      // Normalize comparison
+      const isAllowedTo = allowedStatusesTo.some(
+        s => s.toLowerCase() === statusTo.trim().toLowerCase()
+      );
+      const isExcludedFrom = excludedStatusesFrom.some(
+        s => s.toLowerCase() === statusFrom.trim().toLowerCase()
+      );
+      
+      newRow[headerIndices.resolsla] = 
+        isAllowedTo && !isExcludedFrom ? "Yes" : " ";
+
+      newRow[headerIndices.respsla] =
+        index === 0 || requestId !== rows[index - 1]?.[headerIndices.requestId]
+          ? "Yes"
+          : " ";
+
+      newRow[headerIndices.reqcrdtconc] =
+        newRow[headerIndices.respsla] === "Yes" && creationDateTime
+          ? `${dateUtils.formatDate(creationDate)} ${dateUtils.formatTime(
+              creationTime
+            )}`
+          : " ";
+
+      newRow[headerIndices.endtconc] = dateUtils.formatTime(changeTime);
+
+      newRow[headerIndices.hischdtticonc] = changeDateTime
+        ? `${dateUtils.formatDate(changeDate)} ${dateUtils.formatTime(
+            changeTime
+          )}`
+        : " ";
+
+      newRow[headerIndices.resolsow] = SLA_TABLE[priorityLevel]?.resolsow || 90;
+      newRow[headerIndices.respsow] = SLA_TABLE[priorityLevel]?.respsow || 18;
+
+      return newRow;
+    });
+
+    let lastProcessedRow = null;
+
+    const processedRows = firstPassRows.map((row, index) => {
+      const newRow = [...row];
+      const requestId = newRow[headerIndices.requestId];
+      const prevRow = index > 0 ? lastProcessedRow : null;
+      const nextRow =
+        index < firstPassRows.length - 1 ? firstPassRows[index + 1] : null;
+      const prevRequestId = prevRow ? prevRow[headerIndices.requestId] : null;
+      const nextRequestId = nextRow ? nextRow[headerIndices.requestId] : null;
+      const statusTo = (newRow[headerIndices.historicalStatusTo] || "").toString().trim();
+
+      if (
+        newRow[headerIndices.resolsla] === "Yes" &&
+        newRow[headerIndices.reqcrdtconc] &&
+        newRow[headerIndices.hischdtticonc]
+      ) {
+        const startDate = parseCustomDate(newRow[headerIndices.reqcrdtconc]);
+        const endDate = parseCustomDate(
+          newRow[headerIndices.hischdtticonc] ||
+            new Date().toLocaleString("en-GB")
+        );
+
+        const workingHours = calculationUtils.calculatePreDt(
+          startDate,
+          endDate,
+          WORK_HOURS.start,
+          WORK_HOURS.end,
+          (holidays.length > 0 ? holidays : relevantHolidays),
+          index
+        );
+
+        newRow[headerIndices.calcstdt] = workingHours.toFixed(2);
+      } else {
+        newRow[headerIndices.calcstdt] = "0";
+      }
+
+      newRow[headerIndices.refinedstdt] =
+      parseFloat(newRow[headerIndices.calcstdt] || 0) < 0 ||
+      (newRow[headerIndices.reqTypeDescription] || "").toString().trim() === "Service Request" ||
+      holidays.includes(convertToISODate(newRow[headerIndices.historicalChangeDate])) // Column D
+        ? "0"
+        : newRow[headerIndices.calcstdt];
+        
+      if (
+        newRow[headerIndices.respsla] !== "Yes" &&
+        requestId === prevRequestId &&
+        prevRow?.[headerIndices.hischdtticonc]
+      ) {
+        const startDate = parseCustomDate(prevRow[headerIndices.hischdtticonc]);
+        const endDate = parseCustomDate(
+          newRow[headerIndices.hischdtticonc] ||
+            new Date().toLocaleString("en-GB")
+        );
+
+        const workingHours = calculationUtils.calculatePreDt(
+          startDate,
+          endDate,
+          WORK_HOURS.start,
+          WORK_HOURS.end,
+          (holidays.length > 0 ? holidays : relevantHolidays),
+          index
+        );
+
+        newRow[headerIndices.calcpredt] = workingHours.toFixed(2);
+        if(requestId=="A2266513L"){
+          console.log(workingHours,holidays,relevantHolidays,'fsjkfjnds')
+        }
+      } else {
+        newRow[headerIndices.calcpredt] = "0.00";
+      }
 
 
-const parseDateTime = (dateTimeString, timeStr) => {
-    try {
-        // Case 1: When date and time are passed separately (original CSV format)
-        if (timeStr !== undefined) {
-            const [day, month, year] = dateTimeString.split("/");
-            const [hours, minutes] = timeStr.split(":");
-            return new Date(`20${year}`, month - 1, day, parseInt(hours, 10), parseInt(minutes, 10), 0);
+      newRow[headerIndices.reqcomp] = 
+      (statusTo === "Closed" || statusTo === "Discarded") 
+        ? "End" 
+        : (nextRow && requestId !== nextRequestId)
+          ? "Open" 
+          : " ";
+
+newRow[headerIndices.refinedpredt] =
+  parseFloat(newRow[headerIndices.calcpredt] || 0) < 0 ||
+  (newRow[headerIndices.reqTypeDescription] || "").toString().trim() === "Service Request" ||
+  holidays.includes(convertToISODate(newRow[headerIndices.historicalChangeDate]))
+    ? "0"
+    : newRow[headerIndices.calcpredt];
+
+      newRow[headerIndices.elapsedtime] = (
+        newRow[headerIndices.resolsla] === "Yes" &&
+        (newRow[headerIndices.respsla] === " " || newRow[headerIndices.respsla] === " ")
+          ? parseFloat(newRow[headerIndices.refinedpredt] || 0)
+          : parseFloat(newRow[headerIndices.refinedstdt] || 0)
+      ).toFixed(2);
+
+      let cumulativeHours = 0;
+      if (requestId === prevRequestId) {
+        cumulativeHours = parseFloat(prevRow[headerIndices.cumilative] || 0);
+      }
+      cumulativeHours += parseFloat(newRow[headerIndices.elapsedtime] || 0);
+      newRow[headerIndices.cumilative] =
+        cumulativeHours > 0 ? cumulativeHours.toFixed(2) : "0.00";
+
+      newRow[headerIndices.resolrem] =
+        requestId !== nextRequestId
+          ? (
+              parseFloat(newRow[headerIndices.resolsow]) -
+              parseFloat(newRow[headerIndices.cumilative] || 0)
+            ).toFixed(2)
+          : "0";
+
+          console.log(prevRow?.[headerIndices.resprem] )
+      newRow[headerIndices.resprem] =
+        newRow[headerIndices.respsla] === "Yes"
+          ? parseFloat(newRow[headerIndices.respsow] || 0) -
+            parseFloat(newRow[headerIndices.calcstdt] || 0)
+          : (Number(prevRow?.[headerIndices.resprem]) || 0);
+      newRow[headerIndices.resprem] = (newRow[headerIndices.resprem]||0)?.toFixed(2);
+
+      if (requestId === nextRequestId) {
+        newRow[headerIndices.rollover] = "2000 01";
+      } else if (
+        !["Closed", "Discarded"].includes(
+          newRow[headerIndices.reqStatusDescription]
+        )
+      ) {
+        const today = new Date();
+        newRow[headerIndices.rollover] = `${today.getFullYear()} ${String(
+          today.getMonth() + 1
+        ).padStart(2, "0")}`;
+      } else {
+        let changeDate;
+        try {
+          const [datePart, timePart] =
+            newRow[headerIndices.hischdtticonc].split(" ");
+          const [month,day, year] = datePart.split("/").map(Number);
+          changeDate = new Date(year, month - 1, day);
+        } catch (error) {
+          changeDate = null;
         }
 
-        // Case 2: When it's a combined string (CSV format "DD/MM/YY HH:MM")
-        if (typeof dateTimeString === 'string' && dateTimeString.includes('/')) {
-            const [datePart, timePart] = dateTimeString.split(" ");
-            const [day, month, year] = datePart.split("/");
-            const [hours, minutes] = timePart.split(":");
-            return new Date(`20${year}`, month - 1, day, parseInt(hours, 10), parseInt(minutes, 10), 0);
-        }
+        newRow[headerIndices.rollover] =
+          changeDate && !isNaN(changeDate.getTime())
+            ? `${changeDate.getFullYear()} ${String(
+                changeDate.getMonth() + 1
+              ).padStart(2, "0")}`
+            : " ";
+      }
 
-        // Case 3: When it's an Excel date (number or Date object)
-        if (dateTimeString instanceof Date) {
-            return dateTimeString;
-        }
-        if (typeof dateTimeString === 'number') {
-            return new Date(Math.round((dateTimeString - 25569) * 86400 * 1000));
-        }
+      const currentRollover = newRow[headerIndices.rollover];
+      newRow[headerIndices.dateRollover] = currentRollover;
+      newRow[headerIndices.reqcrym] =
+        currentRollover && currentRollover.trim() !== ""
+          ? newRow[headerIndices.reqCreationDate]
+            ? (() => {
+                let creationDate;
+                try {
+                  const [day,month, year] = newRow[
+                    headerIndices.reqCreationDate
+                  ]
+                    .split("/")
+                    .map(Number);
+                  creationDate = new Date(year, month - 1, day);
+                  if (isNaN(creationDate.getTime())) {
+                    return " ";
+                  }
+                  return `${creationDate.getFullYear()} ${String(
+                    creationDate.getMonth() + 1
+                  ).padStart(2, "0")}`;
+                } catch (error) {
+                  return " ";
+                }
+              })()
+            : " "
+          : "9999 12";
 
-        // Fallback: Try to parse as is
-        return new Date(dateTimeString);
-    } catch (error) {
-        console.error("Error parsing date:", error, "Input:", dateTimeString, timeStr);
-        return new Date(); // Return current date as fallback
-    }
-};
+      newRow[headerIndices.dateReqCrYM] = newRow[headerIndices.reqCreationDate];
+      newRow[headerIndices.dateRollover] = newRow[headerIndices.rollover];
 
+      // Set DateReqCrYM to be exactly the same as ReqCrYM
+      newRow[headerIndices.dateReqCrYM] = newRow[headerIndices.reqcrym];
+      lastProcessedRow = newRow;
+      if(requestId=="A2266513L"){
+        console.log(newRow,'fsjkfjnds')
+      }
+      return newRow;
+    });
 
-
+    setCsvData([headers, ...processedRows]);
+  };
 
   const handleDownload = () => {
-    if (!csvData) return;
-
-    const csvString = Papa.unparse(csvData);
-    const blob = new Blob([csvString], { type: "text/csv" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "fileData.csv";
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  const adjustDateColumns = (csvData, dateColumns) => {
-    if (!csvData || !dateColumns) return csvData;
+    if (!csvData || csvData.length === 0) return;
   
-    const columnNames = dateColumns.split(",").map((col) => col.trim());
-    const headers = csvData[0];
-  
-    const updatedData = csvData.map((row, rowIndex) => {
-      if (rowIndex === 0) return row; // Skip headers
+    const wb = XLSX.utils.book_new();
+    const [headers, ...rows] = csvData;
     
-      return row.map((cell, cellIndex) => {
-        const header = headers[cellIndex];
-        if (columnNames.includes(header)) {
-          try {
-            let totalHours, minutes, seconds;
-    
-            // Handle time strings in "HH:MM:SS" format
-            if (/^\d{1,2}:\d{1,2}:\d{1,2}$/.test(cell)) {
-              [totalHours, minutes, seconds] = cell.split(":").map(Number);
-            }
-            // Handle time strings in "HHMMSS" format (including 5-digit correction)
-            else if (/^\d{5,6}$/.test(cell)) {
-              let timeStr = cell.padStart(6, "0"); // Ensure it's 6 digits
-              totalHours = parseInt(timeStr.substring(0, 2), 10);
-              minutes = parseInt(timeStr.substring(2, 4), 10);
-              seconds = parseInt(timeStr.substring(4, 6), 10);
-            } else {
-              return cell; // Return original value if format is unrecognized
-            }
-    
-            // Format to HH:mm:ss
-            const formattedHours = String(totalHours).padStart(2, "0");
-            const formattedMinutes = String(minutes).padStart(2, "0");
-            const formattedSeconds = String(seconds).padStart(2, "0");
-    
-            return `${formattedHours}:${formattedMinutes}:${formattedSeconds}`;
-          } catch (error) {
-            console.error("Error parsing date:", error);
-          }
+    // Format date fields in the data
+    const formattedRows = rows.map(row => {
+        const newRow = [...row];
+        // Indexes to format: 0 (Req. Creation Date), 7 (Historical Status - Change Date), 
+        // 24 (ReqCrDtConc), 26 (HisChDtTiConc)
+        const dateIndexes = [0, 7];
+        const changeTimeIndex = headers.indexOf("Historical Status - Change Time");
+        if (changeTimeIndex !== -1 && newRow[changeTimeIndex]) {
+            const timeStr = newRow[changeTimeIndex].toString().padStart(6, '0');
+            newRow[changeTimeIndex] = `${timeStr.slice(0, 2)}:${timeStr.slice(2, 4)}:${timeStr.slice(4, 6)}`;
         }
-        return cell; // Return the cell as-is if it's not a date column or parsing fails
-      });
-    });
-    
-  
-    return updatedData;
-  };
-  
-  const calculateReport = () => {
-    if (!csvData2 || csvData2.length < 2) return null;
-    
-    const prioritySLA = {
-        "P1 - Critical": 4,
-        "P2 - High": 8,
-        "P3 - Normal": 45,
-        "P4 - Low": 90
-    };
-
-
-    const headers = csvData2[0];
-    const statusFromIndex = headers.indexOf("Historical Status - Status From");
-    const statusToIndex = headers.indexOf("Req. Status - Description");
-    const requestIdIndex = headers.indexOf("Request - ID");
-    const changeIndex = headers.indexOf("Change");
-    const ticketIndex = headers.indexOf("Request - ID");
-    const priorityIndex = headers.indexOf("Request - Priority Description");
-    const assignedTo = headers.indexOf("Request - Resource Assigned To - Name");
-    const creationDateIndex = headers.indexOf("Historical Status - Change Date");
-
-    // Group data by request ID (removed date filtering)
-    const groupedData = csvData2.slice(1).reduce((acc, item) => {
-        const requestId = item[requestIdIndex];
-        if (!acc[requestId]) {
-            acc[requestId] = [];
-        }
- 
-            acc[requestId].push(item);
-        return acc;
-    }, {});
-
-    const reports = Object.entries(groupedData).map(([requestId, records]) => {
-        if(records?.length>0){
-            // ... rest of the report calculation logic remains the same ...
-            const lastRecord = records[records.length - 1];
-            const status = lastRecord?.length>0 ?lastRecord[statusToIndex]:'';
-            const priority = lastRecord[priorityIndex];
-            const slaHours = prioritySLA[priority] || 40;
-
-            const elapsedTime = records.reduce((sum, record) => {
-                const timeParts = record[changeIndex]?.split(':');
-                let timeInHours = 0;
-                if (timeParts?.length === 2) {
-                    const hours = parseInt(timeParts[0], 10) || 0;
-                    const minutes = parseInt(timeParts[1], 10) || 0;
-                    timeInHours = hours + minutes / 60;
-                } else {
-                    timeInHours = parseFloat(record[changeIndex]) || 0;
+        
+        dateIndexes.forEach(index => {
+            if (newRow[index]) {
+                // If it's a date string in format "dd/mm/yyyy"
+                if (typeof newRow[index] === 'string' && newRow[index].match(/^\d{2}\/\d{2}\/\d{4}$/)) {
+                    const [dd, mm, yyyy] = newRow[index].split('/');
+                    newRow[index] = `${mm}/${dd}/${yyyy}`;
                 }
-                return sum + timeInHours;
-            }, 0);
-
-            const hours = Math.floor(elapsedTime);
-            const minutes = Math.round((elapsedTime - hours) * 60);
-            const formattedTime = `${hours}:${minutes.toString().padStart(2, '0')}`;
-
-            const timeToBreachHours = slaHours - elapsedTime;
-            const breachHours = Math.floor(Math.abs(timeToBreachHours));
-            const breachMinutes = Math.round((Math.abs(timeToBreachHours) - breachHours) * 60);
-            const timeToBreach = timeToBreachHours >= 0 
-                ? `${breachHours}:${breachMinutes.toString().padStart(2, '0')}`
-                : `0:00`;
-
-            return {
-                requestId,
-                ticket: lastRecord[ticketIndex],
-                priority,
-                status,
-                date:lastRecord[creationDateIndex],
-                elapsedTime: formattedTime,
-                breached: elapsedTime > slaHours,
-                totalTime: slaHours,
-                assignedTo: lastRecord[assignedTo],
-                timeToBreach
-            };
-        }
-    }).filter(Boolean); // Remove any undefined entries
-
-    return reports;
-};
-
-const getFilteredReport = () => {
-    if (!report) return [];
-    
-    const parseTimeToBreachValue = (timeStr) => {
-        timeStr = timeStr.replace(/\s*h\s*$/, '').trim();
-        const isNegative = timeStr.startsWith('-');
-        const hours = parseInt(timeStr.replace('-', '').split(':')[0], 10);
-        return isNegative ? -hours : hours;
-    };
-
-    return report
-        .filter(item => {
-            if (!item) return false;
-            
-            // Creation date filtering
-            if (filters.creationDateFrom || filters.creationDateTo) {
-                const creationDate = new Date(item.date.split('/').reverse().join('-'));
-                
-                if (filters.creationDateFrom) {
-                    const fromDate = new Date(filters.creationDateFrom);
-                    fromDate.setHours(0, 0, 0, 0);
-                    if (creationDate < fromDate) return false;
+                // If it's an Excel date number (like 45419)
+                else if (typeof newRow[index] === 'number') {
+                    const date = XLSX.SSF.parse_date_code(newRow[index]);
+                    newRow[index] = `${(date.m).toString().padStart(2, '0')}/${(date.d).toString().padStart(2, '0')}/${date.y}`;
                 }
-
-                if (filters.creationDateTo) {
-                    const toDate = new Date(filters.creationDateTo);
-                    toDate.setHours(23, 59, 59, 999);
-                    if (creationDate > toDate) return false;
+                // If it's a datetime string like "04/01/2024 01:45:31"
+                else if (typeof newRow[index] === 'string' && newRow[index].match(/^\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}:\d{2}$/)) {
+                    const [datePart] = newRow[index].split(' ');
+                    const [dd, mm, yyyy] = datePart.split('/');
+                    newRow[index] = `${mm}/${dd}/${yyyy}`;
                 }
             }
-
-            // Other filters remain the same
-            if (filters.ticket && item.requestId !== filters.ticket) return false;
-            if (filters.assignedTo && item.assignedTo !== filters.assignedTo) return false;
-            if (filters.priority && item.priority !== filters.priority) return false;
-            if (filters.breached && item.breached.toString() !== filters.breached) return false;
-            if (filters.status && item.status !== filters.status) return false;
-            
-            // Time to breach filtering
-            if (filters.timeToBreachValue) {
-                const itemHours = parseTimeToBreachValue(item.timeToBreach);
-                const filterHours = parseInt(filters.timeToBreachValue, 10);
-
-                switch (filters.timeToBreachOption) {
-                    case 'eq':
-                        if (itemHours !== filterHours) return false;
-                        break;
-                    case 'lte':
-                        if (itemHours > filterHours) return false;
-                        break;
-                    case 'gte':
-                        if (itemHours < filterHours) return false;
-                        break;
-                }
-            } 
-            return true;
-        })
-        .sort((a, b) => {
-            return parseTimeToBreachValue(a.timeToBreach) - parseTimeToBreachValue(b.timeToBreach);
         });
+        return newRow;
+    });
+
+    const ws = XLSX.utils.aoa_to_sheet([headers, ...formattedRows]);
+  
+    const HIGHLIGHT_FIELDS = [
+      "ResolSLA", "RespSLA", "ReqComp", "ReqCrDtConc", "EnDtConc", 
+      "HisChDtTiConc", "ElapsedTime", "CalcPreDt", "RefinedPreDt", 
+      "CalcStDt", "RefinedStDt", "Cumilative", "ResolSOW", "RespSOW", 
+      "ResolRem", "RespRem", "Rollover", "ReqCrYM", "DateRollover", "DateReqCrYM"
+    ];
+  
+    const highlightCols = headers.reduce((acc, header, idx) => {
+      if (HIGHLIGHT_FIELDS.includes(header)) acc[idx] = true;
+      return acc;
+    }, {});
+    
+    Object.keys(ws).forEach(key => {
+      if (key !== '!ref') {
+        const col = XLSX.utils.decode_cell(key).c;
+        if (highlightCols[col]) {
+          ws[key].s = {
+            fill: { 
+              patternType: "solid", 
+              fgColor: { rgb: "ADD8E6" } // Light blue color
+            },
+            font: { 
+              bold: XLSX.utils.decode_cell(key).r === 0 // Bold for header row
+            }
+          };
+        }
+      }
+    });
+  
+    XLSX.utils.book_append_sheet(wb, ws, "ProcessedData");
+    XLSX.writeFile(wb, "sla_report.xlsx");
 };
-
-      const parseDate = (dateStr) => {
-          if (!dateStr) return null;
-          
-          try {
-              // For DD/MM/YY format from CSV
-              if (dateStr.includes('/')) {
-                  const [day, month, year] = dateStr.split('/');
-                  const date = new Date(`20${year}`, month - 1, day);
-                  // Check if date is valid
-                  if (isNaN(date.getTime())) return null;
-                  return date;
-              }
-              
-              // For YYYY-MM-DD format from input date field
-              const date = new Date(dateStr);
-              // Check if date is valid
-              if (isNaN(date.getTime())) return null;
-              return date;
-          } catch (error) {
-              console.error('Error parsing date:', error);
-              return null;
-          }
-      };
-
-    const report = calculateReport();
-
-  const getUniqueValues = (data, key) => {
-    if (!data) return [];
-    return [...new Set(data.filter(item => item).map(item => item[key]))];
-  };
 
   return (
-    <div className="p-2 flex flex-col gap-2 items-start">
-      <div className="card2">
-        <h1 className="heading">SLA Breach</h1>
-        <div className="upload-section2">
-          <input
-            type="file"
-            accept=".csv,.xlsx,.xls"
-            onChange={handleFileUpload}
-            className="file-input2"
-          />
-        </div>
-        <div className="column-input-section">
-          {csvData && (
-            <div className="data-section">
-              <button onClick={handleDownload} className="download-button">
-                Download File
+    <div className="min-h-screen bg-gray-100 flex justify-center p-6" style={{marginLeft:'280px'}}>
+      <div className="w-full bg-white rounded-xl shadow-lg p-8">
+        <h1 className="text-2xl font-bold text-gray-800 mb-6">
+          SLA REPORT
+        </h1>
+
+        <div className="mb-8">
+          <div className="flex items-center gap-4">
+            <input
+              id="file-upload"
+              type="file"
+              accept=".csv,.xlsx,.xls"
+              onChange={handleFileUpload}
+              className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100"
+            />
+            {file && (
+              <button
+                onClick={handleSubmit}
+                disabled={isProcessing}
+                className={`px-4 py-2 rounded-md text-white font-semibold ${
+                  isProcessing
+                    ? "bg-gray-400 cursor-not-allowed"
+                    : "bg-indigo-600 hover:bg-indigo-700"
+                } transition-colors duration-200`}
+              >
+                {isProcessing ? (
+                  <span className="flex items-center">
+                    <svg
+                      className="animate-spin -ml-1 mr-3 h-5 w-5 text-white"
+                      xmlns="http://www.w3.org/2000/svg"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                    >
+                      <circle
+                        className="opacity-25"
+                        cx="12"
+                        cy="12"
+                        r="10"
+                        stroke="currentColor"
+                        strokeWidth="4"
+                      ></circle>
+                      <path
+                        className="opacity-75"
+                        fill="currentColor"
+                        d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                      ></path>
+                    </svg>
+                    Processing...
+                  </span>
+                ) : (
+                  "Submit"
+                )}
               </button>
-              <div className="table-wrapper">
-                <table className="table">
-                  <thead>
-                    <tr>
-                      {csvData[0]?.map((header, index) => (
-                        <th key={index} className="table-header">
-                          {header}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {csvData.slice(1).map((row, rowIndex) => (
-                      <tr key={rowIndex}>
-                        {row.map((cell, cellIndex) => (
-                          <td key={cellIndex} className="table-cell">
-                            {cell}
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
+            )}
+
+             {csvData &&<div className="flex justify-between items-center">
+              <button
+                onClick={handleDownload}
+                className="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 transition-colors duration-200 font-semibold"
+              >
+                Download
+              </button>
+              </div>}
+          </div>
         </div>
-        {report && report?.length > 0 && (
-          <div className="report-section">
-            <h2 className="report-heading">Report</h2>
-            <div className="filters-container grid grid-cols-4 gap-4 mb-4">
-              <div>
-                <label>Creation Date From:</label>
-                <input 
-                  type="date" 
-                  value={filters.creationDateFrom}
-                  onChange={(e) => setFilters({...filters, creationDateFrom: e.target.value})}
-                  className="w-full p-2 border rounded"
-                />
-              </div>
 
-              <div>
-                <label>Creation Date To:</label>
-                <input 
-                  type="date" 
-                  value={filters.creationDateTo}
-                  onChange={(e) => setFilters({...filters, creationDateTo: e.target.value})}
-                  className="w-full p-2 border rounded"
-                />
-              </div>
-
-              <div>
-                <label>Priority:</label>
-                <select 
-                  value={filters.priority} 
-                  onChange={(e) => setFilters({...filters, priority: e.target.value})}
-                  className="w-full p-2 border rounded"
-                >
-                  <option value="">All</option>
-                  {getUniqueValues(report, 'priority').map(priority => (
-                    <option key={priority} value={priority}>{priority}</option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="flex gap-2 items-end">
-                <div>
-                  <label>Time to Breach:</label>
-                  <select 
-                    value={filters.timeToBreachOption} 
-                    onChange={(e) => setFilters({...filters, timeToBreachOption: e.target.value})}
-                    className="w-full p-2 border rounded"
-                  >
-                    <option value="eq">Equal to</option>
-                    <option value="lte">Less than or equal to</option>
-                    <option value="gte">Greater than or equal to</option>
-                  </select>
-                </div>
-                <div>
-                  <input 
-                    type="number" 
-                    value={filters.timeToBreachValue}
-                    onChange={(e) => setFilters({...filters, timeToBreachValue: e.target.value})}
-                    placeholder="Enter hours"
-                    className="w-full p-2 border rounded"
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label>Ticket:</label>
-                <select 
-                  value={filters.ticket} 
-                  onChange={(e) => setFilters({...filters, ticket: e.target.value})}
-                  className="w-full p-2 border rounded"
-                >
-                  <option value="">All</option>
-                  {getUniqueValues(report, 'requestId').map(ticket => (
-                    <option key={ticket} value={ticket}>{ticket}</option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label>Assigned To:</label>
-                <select 
-                  value={filters.assignedTo} 
-                  onChange={(e) => setFilters({...filters, assignedTo: e.target.value})}
-                  className="w-full p-2 border rounded"
-                >
-                  <option value="">All</option>
-                  {getUniqueValues(report, 'assignedTo').map(name => (
-                    <option key={name} value={name}>{name}</option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label>Status:</label>
-                <select 
-                  value={filters.status} 
-                  onChange={(e) => setFilters({...filters, status: e.target.value})}
-                  className="w-full p-2 border rounded"
-                >
-                  <option value="">All</option>
-                  {getUniqueValues(report, 'status').map(status => (
-                    <option key={status} value={status}>{status}</option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label>Breached:</label>
-                <select 
-                  value={filters.breached} 
-                  onChange={(e) => setFilters({...filters, breached: e.target.value})}
-                  className="w-full p-2 border rounded"
-                >
-                  <option value="">All</option>
-                  <option value="true">Yes</option>
-                  <option value="false">No</option>
-                </select>
-              </div>
-            </div>
-            
-            {/* Add total records count */}
-            <div className="mb-4 text-sm font-medium">
-              Total Records: {getFilteredReport().length}
-            </div>
-            
-            <table>
-              <thead>
-                <tr>
-                  <th>Ticket</th>
-                  <th>Assigned To</th>
-                  <th>Priority</th>
-                  <th>Elapsed Time</th>
-                  <th>Time to Breach</th>
-                  <th>Breached</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {getFilteredReport().map((item, index) => {
-                   return(
-                    <>
-                     {item &&
-                      <tr key={index}>
-                        <td>{item.requestId}</td>
-                        <td>{item.assignedTo}</td>
-                        <td>{item.priority}</td>
-                        <td>{item.elapsedTime} h</td>
-                        <td>{item.timeToBreach} h</td>
-                        <td>{item.breached ? "Yes" : "No"}</td>
-                        <td>{item.status}</td>
-                      </tr>
-                }
-                    </>
-                   )
-                })}
-              </tbody>
-            </table>
+        {csvData && (
+          <div className="space-y-6">
           </div>
         )}
-      </div> 
+              <div>
+      {csvData&&  <Report data={csvData}/>}
+      </div>
+      </div>
     </div>
   );
 };

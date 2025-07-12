@@ -17,13 +17,13 @@ export default function Sidebar() {
           <li className={`sidebar-item mt-1 ${['/home', '/'].includes(location.pathname) ? "active" : ""}`}>
             <Link to="/" className="sidebar-link">
               <LuHdmiPort size={20} />
-              <span className="link-text">SLA BREACH Manual</span>
+              <span className="link-text">SLA BREACH</span>
             </Link>
           </li>
           <li className={`sidebar-item mt-2 ${location.pathname === "/bot" ? "active" : ""}`}>
             <Link to="/bot" className="sidebar-link">
               <BiAnalyse size={20} />
-              <span className="link-text">SLA BREACH Automatic</span>
+              <span className="link-text">SLA Agent</span>
             </Link>
           </li>
           {/* <li className={`sidebar-item mt-2 ${location.pathname === "/missing-value" ? "active" : ""}`}>
